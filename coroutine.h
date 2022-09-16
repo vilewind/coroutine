@@ -47,6 +47,8 @@ public:
     ptrdiff_t size_;
 	bool is_used_;
     Status status_;
+    bool is_execFunc_;
+    int co_id_{-1};
 private:    
     Callback cb_;
 };

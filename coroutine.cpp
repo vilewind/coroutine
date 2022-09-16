@@ -17,9 +17,21 @@
 static thread_local CoPool t_coPool;
 
 void CoFunc(Coroutine *co) {
+    #ifdef DEBUF
+        std::cout << __func__ << " coid : " << co->co_id_ << std::endl; 
+    #endif
     Coroutine::Callback cb = co->getCallback();
     if (cb) 
         cb();
+    // Coroutine::Yield();
+    ///@brief 重置相关标志，用以执行其他任务
+
+    co->is_execFunc_ = false;
+    co->status_ = Coroutine::CO_READY;
+    co->is_used_ = false;
+    #ifdef DEBUF
+    std::cout << __func__ << " coid : " << co->co_id_ << " finished" << std::endl; 
+    #endif
     Coroutine::Yield();
 }
 
@@ -66,7 +78,8 @@ Coroutine::Coroutine()
       cap_(0),
       size_(0),
       is_used_(false),
-      status_(CO_READY)
+      status_(CO_READY),
+      is_execFunc_(false)
 {
     memset(&ctx_, 0, sizeof ctx_);
     /* if (t_mainCoroutine == nullptr) { */
@@ -93,13 +106,7 @@ void Coroutine::stackCopy(char* top) {
     }
 
     size_ = top - &dummy;
-    #ifdef DEBUF
-    std::cout << __func__ << " before memcpy" << std::endl;
-    #endif
     memcpy(stack_sp_, &dummy, size_);
-    #ifdef DEBUF
-    std::cout << __func__ << " after memcpy" << std::endl;
-    #endif
 }
 
 void Coroutine::coroutineMake() {
@@ -122,8 +129,13 @@ bool Coroutine::isMainCoroutine() {
 }
 
 void Coroutine::setCallback(Callback cb) {
+    if (is_execFunc_)
+    {
+        std::cerr << "current coroutine already has task to exec";
+        return;
+    }
     cb_ = cb;
-    getMainCoroutine();
+    is_execFunc_ = true;
 }
 
 Coroutine* Coroutine::getMainCoroutine() {
@@ -155,12 +167,13 @@ Coroutine* Coroutine::getInstanceCoroutine() {
         }
     }
     std::cout << "get instance coroutine" << std::endl;
+    t_coPool.coroutine_pool[cur]->co_id_ = t_coPool.coroutine_pool[cur]->co_id_ == -1 ?  cur : t_coPool.coroutine_pool[cur]->co_id_;
     t_coPool.coroutine_pool[cur]->is_used_ = true;
     return t_coPool.coroutine_pool[cur];
 }
 
 void Coroutine::Resume(Coroutine* co) {
-    if (co == nullptr || co->is_used_ == false) {
+    if (co == nullptr || co->is_used_ == false || co->is_execFunc_ == false) {
         /* target coroutine is nullptr*/
         return;
     }
@@ -173,13 +186,7 @@ void Coroutine::Resume(Coroutine* co) {
     if (co->status_ == CO_READY)
         co->coroutineMake();
     else if (co->status_ == CO_SUSPEND) {
-         #ifdef DEBUF
-        std::cout << __func__ << " before memcpy" << std::endl;
-        #endif
         memcpy(t_coPool.shared_stack + t_coPool.SSIZE - co->size_, co->stack_sp_, co->size_);
-         #ifdef DEBUF
-         std::cout << __func__ << " after memcpy" << std::endl;
-        #endif
     } 
     else
     {
@@ -197,8 +204,21 @@ void Coroutine::Yield() {
     }
 
     Coroutine* co = t_coPool.cur_coroutine;
+    /// @bug 处理完任务后，为了协程重用，设置了初始化了co的标志，导致无法yield执行main程序
+    // if (co == nullptr || co->is_used_ == false || co->is_execFunc_ == false) {
+    if (co == nullptr) {
+        /* target coroutine is nullptr*/
+        return;
+    }
     t_coPool.cur_coroutine = t_coPool.main_coroutine;
     co->status_ = CO_SUSPEND;
     co->stackCopy(t_coPool.shared_stack + t_coPool.SSIZE);
+    #ifdef DEBUF
+    std::cout << " coid : " << co->co_id_ << std::endl;
+    #endif
     coctx_swap(&co->ctx_, &t_coPool.main_coroutine->ctx_);
+    #ifdef DEBUF
+    std::cout << __func__ << " after coctx_swap" << std::endl;
+    #endif
 }
+

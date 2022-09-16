@@ -8,16 +8,57 @@
 #include <vector>
 #include <iostream>
 
-static thread_local Coroutine::CoroutineSptr t_mainCoroutine = nullptr;
-static thread_local Coroutine::CoroutineSptr t_curCoroutine = nullptr;
-static thread_local char shared_stack[1024 * 512];
-static thread_local std::vector<Coroutine::CoroutineSptr> t_coroutinePool;
+#define DEBUF
+
+// static thread_local Coroutine::CoroutineSptr t_mainCoroutine = nullptr;
+// static thread_local Coroutine::CoroutineSptr t_curCoroutine = nullptr;
+// static thread_local char shared_stack[1024 * 512];
+// static thread_local std::vector<Coroutine::CoroutineSptr> t_coroutinePool;
+static thread_local CoPool t_coPool;
 
 void CoFunc(Coroutine *co) {
     Coroutine::Callback cb = co->getCallback();
     if (cb) 
         cb();
     Coroutine::Yield();
+}
+
+CoPool::CoPool()
+{
+    if (main_coroutine == nullptr) {
+        main_coroutine = new Coroutine();
+        cur_coroutine = main_coroutine;
+        shared_stack = new char[SSIZE]();
+    } 
+    else 
+    {
+        std::cerr << "copool create error";
+        ::exit(EXIT_FAILURE);
+    }
+}
+
+CoPool::~CoPool()
+{
+    if (main_coroutine)
+	{
+		if (cur_coroutine != main_coroutine)
+		{
+			delete cur_coroutine;
+			cur_coroutine = nullptr;
+		}
+        delete main_coroutine;
+		main_coroutine = nullptr;
+	}
+    if (shared_stack) 
+	{
+        delete shared_stack;
+		shared_stack = nullptr;
+	}
+	for (auto it = coroutine_pool.begin(); it != coroutine_pool.end(); )
+    {
+        delete *it++;
+    }
+    std::cout << __func__ << std::endl;
 }
 
 Coroutine::Coroutine()
@@ -42,20 +83,28 @@ Coroutine::~Coroutine() {
 
 void Coroutine::stackCopy(char* top) {
     char dummy = 0;
-    assert(top - &dummy <= sizeof shared_stack);
+    assert(top - &dummy <= t_coPool.SSIZE);
     if (cap_ < top - &dummy) {
+        if (stack_sp_ != t_coPool.shared_stack)
+            delete stack_sp_;
         stack_sp_ = nullptr;
         cap_ = top - &dummy;
         stack_sp_ = reinterpret_cast<char*>(malloc(cap_));
     }
 
     size_ = top - &dummy;
+    #ifdef DEBUF
+    std::cout << __func__ << " before memcpy" << std::endl;
+    #endif
     memcpy(stack_sp_, &dummy, size_);
+    #ifdef DEBUF
+    std::cout << __func__ << " after memcpy" << std::endl;
+    #endif
 }
 
 void Coroutine::coroutineMake() {
-    stack_sp_ = shared_stack;
-    size_ = sizeof shared_stack;
+    stack_sp_ = t_coPool.shared_stack;
+    size_ = t_coPool.SSIZE;
     char* top = stack_sp_ + size_;
     top = reinterpret_cast<char *>((reinterpret_cast<unsigned long>(top)) & -16LL);
 
@@ -67,7 +116,7 @@ void Coroutine::coroutineMake() {
 }
 
 bool Coroutine::isMainCoroutine() {
-    if (t_mainCoroutine == nullptr || t_mainCoroutine == t_curCoroutine)
+    if (t_coPool.main_coroutine == nullptr || t_coPool.main_coroutine == t_coPool.cur_coroutine)
         return true;
     return false;
 }
@@ -77,39 +126,41 @@ void Coroutine::setCallback(Callback cb) {
     getMainCoroutine();
 }
 
-Coroutine::CoroutineSptr Coroutine::getMainCoroutine() {
-    if (t_mainCoroutine == nullptr) {
+Coroutine* Coroutine::getMainCoroutine() {
+    /*if (t_mainCoroutine == nullptr) {
         t_mainCoroutine = std::make_shared<Coroutine>();
         t_curCoroutine = t_mainCoroutine;
     }
-    return t_mainCoroutine;
+	*/
+    return t_coPool.main_coroutine;
 }
 
-Coroutine::CoroutineSptr Coroutine::getCurCoroutine() {
-    if (t_curCoroutine == nullptr)
+Coroutine* Coroutine::getCurCoroutine() {
+    /*if (t_curCoroutine == nullptr)
         getMainCoroutine();
-    return t_curCoroutine;
+    */
+	return t_coPool.cur_coroutine;
 }
 
-Coroutine::CoroutineSptr Coroutine::getInstanceCoroutine() {
+Coroutine* Coroutine::getInstanceCoroutine() {
     int cur = 0;
-    for (; cur < t_coroutinePool.size() && !t_coroutinePool.empty(); ++cur) {
-        if (t_coroutinePool[cur] != nullptr && t_coroutinePool[cur]->is_used_ == false && t_coroutinePool[cur]->status_ == CO_READY) 
+    for (; cur < t_coPool.coroutine_pool.size() && !t_coPool.coroutine_pool.empty(); ++cur) {
+        if (t_coPool.coroutine_pool[cur] != nullptr && t_coPool.coroutine_pool[cur]->is_used_ == false && t_coPool.coroutine_pool[cur]->status_ == CO_READY) 
             break;
     }
     
-    if (cur >= t_coroutinePool.size()) {
+    if (cur >= t_coPool.coroutine_pool.size()) {
         for (int i = cur; i < cur + 16; ++i) {
-            t_coroutinePool.push_back(std::make_shared<Coroutine>());
+            t_coPool.coroutine_pool.emplace_back(new Coroutine());
         }
     }
     std::cout << "get instance coroutine" << std::endl;
-    t_coroutinePool[cur]->is_used_ = true;
-    return t_coroutinePool[cur];
+    t_coPool.coroutine_pool[cur]->is_used_ = true;
+    return t_coPool.coroutine_pool[cur];
 }
 
-void Coroutine::Resume(CoroutineSptr co) {
-    if (co == nullptr || co->status_ == CO_DEAD) {
+void Coroutine::Resume(Coroutine* co) {
+    if (co == nullptr || co->is_used_ == false) {
         /* target coroutine is nullptr*/
         return;
     }
@@ -122,10 +173,21 @@ void Coroutine::Resume(CoroutineSptr co) {
     if (co->status_ == CO_READY)
         co->coroutineMake();
     else if (co->status_ == CO_SUSPEND) {
-        memcpy(shared_stack + sizeof shared_stack - co->size_, co->stack_sp_, co->size_);
+         #ifdef DEBUF
+        std::cout << __func__ << " before memcpy" << std::endl;
+        #endif
+        memcpy(t_coPool.shared_stack + t_coPool.SSIZE - co->size_, co->stack_sp_, co->size_);
+         #ifdef DEBUF
+         std::cout << __func__ << " after memcpy" << std::endl;
+        #endif
+    } 
+    else
+    {
+        assert(0);
     }
-    t_curCoroutine = co;
-    coctx_swap(&t_mainCoroutine->ctx_, &co->ctx_);
+    co->status_ = CO_RUNNING;
+    t_coPool.cur_coroutine = co;
+    coctx_swap(&t_coPool.main_coroutine->ctx_, &co->ctx_);
 }
 
 void Coroutine::Yield() {
@@ -134,9 +196,9 @@ void Coroutine::Yield() {
         return;
     }
 
-    CoroutineSptr co = t_curCoroutine;
-    t_curCoroutine = t_mainCoroutine;
+    Coroutine* co = t_coPool.cur_coroutine;
+    t_coPool.cur_coroutine = t_coPool.main_coroutine;
     co->status_ = CO_SUSPEND;
-    co->stackCopy(shared_stack + sizeof shared_stack);
-    coctx_swap(&co->ctx_, &t_mainCoroutine->ctx_);
+    co->stackCopy(t_coPool.shared_stack + t_coPool.SSIZE);
+    coctx_swap(&co->ctx_, &t_coPool.main_coroutine->ctx_);
 }
